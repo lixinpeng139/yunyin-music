@@ -12,7 +12,7 @@
     "tauri": "tauri",
     "app": "tauri dev",
     "app:build": "npm run build:sidecar && ./scripts/build-appimage.sh",
-    "app:deb": "npm run build:sidecar && tauri build --bundles deb"
+    "app:deb": "npm run build:sidecar && ./scripts/build-deb.sh"
   },
   "dependencies": {
     "@emotion/react": "^11.14.0",

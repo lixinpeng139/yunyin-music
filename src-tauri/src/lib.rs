@@ -150,19 +150,41 @@ fn pick_port() -> u16 {
 fn sidecar_candidates(app: &tauri::AppHandle) -> Vec<PathBuf> {
     let mut candidates = Vec::new();
 
+    // The bundle may keep the target triple in the file name (`externalBin`
+    // sources are named `yunyin-api-<triple>`) or strip it on install, and the
+    // two bundlers differ: the AppImage keeps `yunyin-api`, a Debian package
+    // installs it under the resource directory. Try every spelling in both
+    // places so neither layout is missed.
+    const STEMS: [&str; 2] = ["yunyin-api", "yunyin-api-x86_64-unknown-linux-gnu"];
+
     // 1. Shipped through `bundle > externalBin`.
     if let Ok(dir) = app.path().resource_dir() {
-        candidates.push(dir.join("yunyin-api"));
-        candidates.push(dir.join("binaries").join("yunyin-api"));
+        for stem in STEMS {
+            candidates.push(dir.join(stem));
+            candidates.push(dir.join("binaries").join(stem));
+        }
     }
     // 2. Next to the executable (AppImage / portable layouts).
     if let Ok(exe) = std::env::current_exe() {
         if let Some(dir) = exe.parent() {
-            candidates.push(dir.join("yunyin-api"));
-            candidates.push(dir.join("binaries").join("yunyin-api"));
+            for stem in STEMS {
+                candidates.push(dir.join(stem));
+                candidates.push(dir.join("binaries").join(stem));
+            }
+            // Debian layout: /usr/bin/yunyin with the helper in /usr/lib/yunyin.
+            if let Some(prefix) = dir.parent() {
+                for stem in STEMS {
+                    candidates.push(prefix.join("lib").join("yunyin").join(stem));
+                }
+            }
         }
     }
-    // 3. Development locations. `tauri dev` runs the binary from src-tauri.
+    // 3. Absolute fallbacks, in case the resource dir is resolved unexpectedly.
+    for stem in STEMS {
+        candidates.push(PathBuf::from("/usr/lib/yunyin").join(stem));
+        candidates.push(PathBuf::from("/usr/lib").join(stem));
+    }
+    // 4. Development locations. `tauri dev` runs the binary from src-tauri.
     for base in [PathBuf::from(".."), PathBuf::from(".")] {
         candidates.push(base.join("sidecar").join("dist").join("yunyin-api"));
     }

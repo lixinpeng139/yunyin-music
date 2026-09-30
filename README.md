@@ -26,37 +26,41 @@
 
 ## 安装
 
-### 从 AppImage 运行（推荐）
+### 下载预编译包
+
+到 [Releases](https://github.com/lixinpeng139/yunyin-music/releases) 下载：
+
+| 格式 | 适用 | 说明 |
+| --- | --- | --- |
+| `yunyin_0.1.0_amd64.deb` | Debian / Ubuntu | **推荐**。依赖由包管理器保证，含播放所需的 GStreamer 插件 |
+| `yunyin-0.1.0-x86_64.AppImage` | 其它发行版 | 自包含（WebKit、GTK、GStreamer 及 193 个插件都在里面），无需预装依赖 |
 
 ```bash
-# 产物在 src-tauri/target/release/bundle/appimage/ 下
-chmod +x 云音_0.1.0_amd64.AppImage
-./云音_0.1.0_amd64.AppImage
+# Debian / Ubuntu
+sudo apt install ./yunyin_0.1.0_amd64.deb
+
+# AppImage
+chmod +x yunyin-0.1.0-x86_64.AppImage
+./yunyin-0.1.0-x86_64.AppImage
 ```
 
-### 关于可移植性
+两种格式都会注册桌面入口，安装后在启动器里搜索「云音」即可。
 
-AppImage 是自包含的：WebKitGTK、GTK3、GStreamer 及其 193 个插件都由它自带
-（实测运行时映射的是 `/tmp/.mount_*/usr/lib/` 下的库，而非系统的）。因此理论上
-不要求目标机器预装这些依赖。
+> AppImage 构建于较新的 Arch，在更老的发行版上可能受 glibc 版本限制；遇到这种情况请用 deb。
 
-需要注意的是它**在较新的 Arch 上构建**，因此对更老的发行版可能因为 glibc 版本
-而过不去。若遇到这种情况，用源码构建，或使用 deb / rpm：
+### 注册到桌面（仅 AppImage 需要）
+
+deb 会自动注册，AppImage 需要手动执行一次：
 
 ```bash
-npm run app:deb      # 依赖由包管理器声明，兼容性最好
+./scripts/install-desktop.sh /path/to/yunyin-0.1.0-x86_64.AppImage
 ```
 
-### 注册到桌面（niri 启动器可直接搜到）
-
-```bash
-./scripts/install-desktop.sh /path/to/云音_0.1.0_amd64.AppImage
-```
-
-之后 `Mod+D` 里搜索「云音」即可。想在 niri 里直接绑定快捷键，在 `~/.config/niri/binds.kdl` 加：
+之后 `Mod+D` 里搜索「云音」即可。想在 niri 里直接绑定快捷键，在
+`~/.config/niri/binds.kdl` 加：
 
 ```kdl
-Mod+Shift+M { spawn "/path/to/云音_0.1.0_amd64.AppImage"; }
+Mod+Shift+M { spawn "/path/to/yunyin-0.1.0-x86_64.AppImage"; }
 ```
 
 ## 从源码运行

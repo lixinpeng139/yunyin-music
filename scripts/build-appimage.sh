@@ -21,8 +21,8 @@ RUNTIME="${APPIMAGE_RUNTIME_FILE:-$HOME/.cache/yunyin/runtime-x86_64}"
 LD_ROOT="$HOME/.cache/yunyin/linuxdeploy"
 APPIMAGE_TOOL="$LD_ROOT/plugins/linuxdeploy-plugin-appimage/appimagetool-prefix/AppRun"
 BUNDLE_DIR="$ROOT/src-tauri/target/release/bundle/appimage"
-APP_DIR="$BUNDLE_DIR/云音.AppDir"
-OUTPUT="$BUNDLE_DIR/云音_0.1.0_amd64.AppImage"
+APP_DIR="$BUNDLE_DIR/yunyin.AppDir"
+OUTPUT="$BUNDLE_DIR/yunyin_0.1.0_amd64.AppImage"
 
 if [ ! -s "$RUNTIME" ]; then
   echo "[bundle] runtime missing at $RUNTIME" >&2

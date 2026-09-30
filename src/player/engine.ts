@@ -33,6 +33,15 @@ export class AudioEngine {
    */
   private playingHowl: Howl | null = null;
   private playingId: number | null = null;
+  /**
+   * Where playback was when it was paused.
+   *
+   * Howler's html5 mode builds an <audio> per sound in the Howl, and
+   * `howl.pause()` with no id pauses **all** of them — including one that resets
+   * `currentTime` to 0. Resuming therefore has to re-assert the position rather
+   * than trusting the element to still be where it was.
+   */
+  private pausedAtMs: number | null = null;
   private events: AudioEvents = {};
   private pendingSeek: number | null = null;
   private voulmeLevel = 0.8;
@@ -126,57 +135,38 @@ export class AudioEngine {
     const howl = this.howl;
     if (!howl) return;
 
-    // Already sounding this exact Howl: starting again would layer another
-    // source on top of the first.
     if (this.playingHowl === howl && howl.playing(this.playingId ?? undefined)) {
+      return; // already sounding this Howl
+    }
+
+    if (this.playingId !== null && this.playingHowl === howl) {
+      // Resume the sound that was paused, then put the position back: the pause
+      // may have reset the element to 0.
+      const resumeAt = this.pausedAtMs;
+      howl.play(this.playingId);
+      if (resumeAt && resumeAt > 500) {
+        this.howl?.seek(resumeAt / 1000, this.playingId);
+      }
+      this.pausedAtMs = null;
       return;
     }
 
-    // Resuming an existing, paused sound must name its id. `howl.play()` with no
-    // id picks from the pool — reusing a sound only when exactly one is paused —
-    // which restarted the track from the beginning instead of continuing.
-    const resumable =
-      this.playingId !== null &&
-      this.playingHowl === howl &&
-      howl.playing(this.playingId) === false;
-
-    if (resumable) {
-      howl.play(this.playingId as number);
-      return;
-    }
-
-    // Otherwise collapse to a single source. Howler's `play()` with no id will
-    // activate another pooled sound, and several audible sounds are heard as a
-    // doubled, echoing vocal.
-    this.stopAllSounds(howl);
-
+    // First start for this Howl: one source, addressed by its id.
     const id = howl.play();
     this.playingHowl = howl;
     this.playingId = typeof id === "number" ? id : null;
+    this.pausedAtMs = null;
   }
 
-  /**
-   * Silences every sound belonging to a Howl, without unloading it.
-   *
-   * `_sounds` is Howler's internal pool and is not part of its public types,
-   * hence the local shape declaration.
-   */
-  private stopAllSounds(howl: Howl) {
-    const pool = (howl as unknown as { _sounds?: Array<{ _id: number }> })
-      ._sounds;
-    for (const sound of pool ?? []) {
-      try {
-        howl.stop(sound._id);
-      } catch {
-        /* already gone */
-      }
-    }
-  }
 
   pause() {
-    this.howl?.pause();
-    this.playingHowl = null;
-    this.playingId = null;
+    if (!this.howl) return;
+    // Record first: pausing may zero the element's currentTime.
+    const at = this.position;
+    if (at > 0) this.pausedAtMs = at;
+    // Address the sounding id only; the no-arg form hits every pooled element.
+    if (this.playingId !== null) this.howl.pause(this.playingId);
+    else this.howl.pause();
   }
 
   stop() {

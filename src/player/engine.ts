@@ -93,7 +93,14 @@ export class AudioEngine {
         }
         if (opts.autoplay) this.play();
       },
-      onplay: () => this.events.onPlay?.(),
+      onplay: () => {
+        // `volume()` on the Howl would touch every pooled sound and stack gain,
+        // so it is applied to the sounding id only.
+        if (this.playingId !== null) {
+          this.howl?.volume(this.effectiveVolume(), this.playingId);
+        }
+        this.events.onPlay?.();
+      },
       onpause: () => this.events.onPause?.(),
       onend: () => {
         this.playingHowl = null;
@@ -125,13 +132,22 @@ export class AudioEngine {
       return;
     }
 
-    // Stop anything still running on this Howl before starting.
-    //
-    // Howler's `play()` with no id only reuses an existing sound when exactly
-    // one is paused; otherwise it activates another one from the pool. Over a
-    // few pause/resume cycles the Howl accumulated several sounds that all
-    // stayed audible — heard as a doubled, echoing vocal. Collapsing to a single
-    // source first makes that impossible.
+    // Resuming an existing, paused sound must name its id. `howl.play()` with no
+    // id picks from the pool — reusing a sound only when exactly one is paused —
+    // which restarted the track from the beginning instead of continuing.
+    const resumable =
+      this.playingId !== null &&
+      this.playingHowl === howl &&
+      howl.playing(this.playingId) === false;
+
+    if (resumable) {
+      howl.play(this.playingId as number);
+      return;
+    }
+
+    // Otherwise collapse to a single source. Howler's `play()` with no id will
+    // activate another pooled sound, and several audible sounds are heard as a
+    // doubled, echoing vocal.
     this.stopAllSounds(howl);
 
     const id = howl.play();

@@ -36,14 +36,15 @@ chmod +x 云音_0.1.0_amd64.AppImage
 
 ### 关于可移植性
 
-这个 AppImage **链接宿主系统的 WebKitGTK**，因此并不通用：它需要目标机器装有
-`webkit2gtk-4.1` 及其 GStreamer 插件。打包脚本会把 `gstreamer-1.0` 的插件目录
-一并放进 AppImage（否则播放会直接导致 web 进程 abort），但 WebKit 本体仍来自系统。
+AppImage 是自包含的：WebKitGTK、GTK3、GStreamer 及其 193 个插件都由它自带
+（实测运行时映射的是 `/tmp/.mount_*/usr/lib/` 下的库，而非系统的）。因此理论上
+不要求目标机器预装这些依赖。
 
-同版本 Arch 上可以直接跑。要在别的发行版分发，建议改用 deb / rpm，由包管理器声明依赖：
+需要注意的是它**在较新的 Arch 上构建**，因此对更老的发行版可能因为 glibc 版本
+而过不去。若遇到这种情况，用源码构建，或使用 deb / rpm：
 
 ```bash
-npm run app:deb      # 依赖里会写明 webkit2gtk-4.1 与 gstreamer 插件
+npm run app:deb      # 依赖由包管理器声明，兼容性最好
 ```
 
 ### 注册到桌面（niri 启动器可直接搜到）

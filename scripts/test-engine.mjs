@@ -1,98 +1,92 @@
 /**
- * Drives the real AudioEngine through play / pause / resume cycles and reports
- * the position at each step, which is where the reported bugs live.
+ * Drives the real AudioEngine through play / pause / resume cycles.
+ *
+ * The page is booted at the dev server so `import.meta.env.VITE_NCM_API` points
+ * at a live bridge, and the session id is injected so API calls are signed in.
  */
 import { chromium } from 'playwright'
 
 const browser = await chromium.launch()
 const page = await browser.newPage({ viewport: { width: 900, height: 700 } })
 await page.setViewportSize({ width: 900, height: 700 })
-await page.goto('http://127.0.0.1:1570/', { waitUntil: 'domcontentloaded' })
-await page.waitForTimeout(4000)
+await page.addInitScript(
+  (id) => localStorage.setItem('yunyin.client.v1', id),
+  process.env.CID || '',
+)
+await page.goto(process.env.BASE || 'http://127.0.0.1:1580/', { waitUntil: 'domcontentloaded' })
+await page.waitForTimeout(5000)
 
 const result = await page.evaluate(async () => {
   const { audioEngine: e } = await import('/src/player/engine.ts')
   const ncm = await import('/src/api/ncm.ts')
 
-  // fetchDailySongs returns tracks without playback urls; resolve one the same
-  // way the player does.
   const tracks = await ncm.fetchDailySongs()
   if (!tracks.length) return { error: 'no tracks' }
-  const ids = tracks.slice(0, 6).map((t) => t.id)
-  const urls = await ncm.fetchSongUrls(ids, 'exhigh')   // returns a Map
+  const urls = await ncm.fetchSongUrls(tracks.slice(0, 6).map((t) => t.id), 'exhigh')
   let track = null
   for (const t of tracks) {
-    const info = urls.get(t.id)
-    if (info?.url) { track = { ...t, url: info.url, gain: info.gain }; break }
+    const i = urls.get(t.id)
+    if (i?.url) { track = { ...t, url: i.url, gain: i.gain }; break }
   }
-  if (!track) return { error: 'no playable url among ' + ids.length + ' tracks' }
+  if (!track) return { error: 'no playable url' }
 
-  const log = []
-  const snap = (label) => {
-    log.push({
-      label,
-      pos: e.position,
-      dur: e.duration,
-      playing: e.playing,
-    })
-  }
-
+  const cycles = []
   e.setEvents({})
-  const t0 = performance.now()
   e.load(track, { autoplay: true, gain: track.gain })
-  // Poll until the media reports a duration, so the load latency is visible.
+
+  // Wait for the media to report a duration.
   let loadedAt = null
+  const t0 = performance.now()
   for (let i = 0; i < 40; i += 1) {
-    await new Promise((r) => setTimeout(r, 500))
+    await new Promise((r) => setTimeout(r, 250))
     if (e.duration > 0) { loadedAt = Math.round(performance.now() - t0); break }
   }
-  log.push({ label: `loaded after ${loadedAt ?? '>20000'}ms`, pos: e.position, dur: e.duration, playing: e.playing })
-  await new Promise((r) => setTimeout(r, 3000))
-  snap('play 3s more')
 
-  for (let i = 1; i <= 8; i += 1) {
+  for (let i = 1; i <= 6; i += 1) {
+    await new Promise((r) => setTimeout(r, 2000))
+    const beforePause = e.position
     e.pause()
+    await new Promise((r) => setTimeout(r, 400))
+    const atPause = e.position
     await new Promise((r) => setTimeout(r, 600))
-    const a = e.position
-    await new Promise((r) => setTimeout(r, 900))
-    const b = e.position
-    const held = Math.abs(b - a) < 300
+    const held = e.position
     e.play()
-    await new Promise((r) => setTimeout(r, 2500))
-    const after = e.position
-    log.push({
-      label: `cycle ${i}`,
-      pos: after,
-      dur: e.duration,
+    await new Promise((r) => setTimeout(r, 400))
+    const justResumed = e.position
+    await new Promise((r) => setTimeout(r, 1600))
+    const afterResume = e.position
+    cycles.push({
+      i,
+      beforePause,
+      atPause,
+      heldOk: Math.abs(held - atPause) < 250,
+      justResumed,
+      afterResume,
+      advanced: afterResume - justResumed,
+      backToZero: justResumed < 200,
       playing: e.playing,
-      held,
-      jumpedBack: after < a - 200,
-      atZero: after < 50,
     })
   }
-  return { log, title: track.name }
+  return { cycles, loadedAt, title: track.name, dur: e.duration }
 })
 
 if (result.error) {
   console.log('  错误:', result.error)
 } else {
-  console.log('  曲目:', result.title)
-  let prev = null
-  for (const r of result.log) {
-    const delta = prev === null ? '' : `  Δ=${r.pos - prev}ms`
+  console.log(`  曲目: ${result.title}   加载耗时 ${result.loadedAt}ms   时长 ${result.dur}ms\n`)
+  for (const c of result.cycles) {
     console.log(
-      `  ${String(r.label).padEnd(22)} pos=${String(r.pos).padStart(6)}ms dur=${r.dur} playing=${r.playing}` +
-        (r.held === undefined ? '' : ` held=${r.held}`) +
-        (r.jumpedBack ? ' JUMPED-BACK' : '') +
-        (r.atZero ? ' AT-ZERO' : ''),
+      `  第 ${c.i} 轮  暂停前 ${String(c.beforePause).padStart(6)}ms  ` +
+      `暂停后 ${String(c.held).padStart(6)}ms(保持=${c.heldOk ? '✓' : '✗'})  ` +
+      `恢复瞬间 ${String(c.justResumed).padStart(6)}ms  ` +
+      `1.6s后 ${String(c.afterResume).padStart(6)}ms  ` +
+      `前进 ${c.advanced}ms ${c.advanced > 1000 ? '✓' : '⚠'}  playing=${c.playing}`,
     )
-    prev = r.pos
   }
-  const cycles = result.log.filter((r) => r.label.startsWith('cycle'))
-  const zero = cycles.filter((r) => r.atZero).length
-  const back = cycles.filter((r) => r.jumpedBack).length
-  const notHeld = cycles.filter((r) => r.held === false).length
-  console.log(`\n  8 轮结果: 停在 0:00 ${zero} 次 | 位置倒退 ${back} 次 | 暂停未保持 ${notHeld} 次`)
-  console.log(zero === 0 && back === 0 ? '  ✓ 正常' : '  ⚠ 复现了用户报告的问题')
+  const zero = result.cycles.filter((c) => c.backToZero).length
+  const stuck = result.cycles.filter((c) => c.advanced <= 1000).length
+  const notHeld = result.cycles.filter((c) => !c.heldOk).length
+  console.log(`\n  恢复到 0:00 的次数: ${zero}   恢复后不前进: ${stuck}   暂停未保持: ${notHeld}`)
+  console.log(zero === 0 && stuck === 0 && notHeld === 0 ? '  ✓ 全部正常' : '  ⚠ 存在问题')
 }
 await browser.close()

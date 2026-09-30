@@ -2,12 +2,24 @@ import { Howl, Howler } from "howler";
 import type { Track } from "../types/ncm";
 
 /**
- * Thin wrapper over Howler that plays one track at a time.
+ * Plays one track at a time on top of Howler.
  *
- * Howler is used through its `html5: true` path because the webview's Web Audio
- * path would require CORS headers on NetEase's CDN, which we do not control.
- * A single long-lived instance is swapped per track to keep the media element
- * pool from growing.
+ * Howler ends up on its **Web Audio** path here regardless of the `html5`
+ * option — the audio context is created when the module loads, so `html5` is
+ * already fixed. That matters because the two paths behave differently:
+ *
+ *   * Every sound gets a GainNode connected to the master output, and each live
+ *     connection shows up as a separate stream in the system mixer. `unload()`
+ *     does not sever it, so discarding a Howl without disconnecting first leaked
+ *     a stream per track and more than one could be audible at once — heard as a
+ *     doubled, echoing vocal.
+ *   * `howl.pause()` with no id pauses every pooled sound, and one of them
+ *     resets `currentTime` to 0, which made a resume restart the track.
+ *   * `howl.playing(id)` stays true while paused, so it cannot be used to decide
+ *     whether playback needs resuming.
+ *
+ * The engine therefore tracks its own paused state, records the position across
+ * a pause, and addresses the sounding sound **by id** everywhere.
  */
 
 export interface AudioEvents {
@@ -21,30 +33,17 @@ export interface AudioEvents {
 export class AudioEngine {
   private howl: Howl | null = null;
   private currentId: number | null = null;
-  /**
-   * The Howl that already has an audio source running, and the sound id it was
-   * started with.
-   *
-   * Web Audio is the path Howler actually takes here, and each `play()` there
-   * builds a fresh BufferSourceNode wired straight to the output — so calling it
-   * twice plays the same track twice, which is heard as a doubled/echoing vocal.
-   * The HTML5 path tolerates a repeated `play()` (it just resumes), which is why
-   * this was easy to miss.
-   */
-  private playingHowl: Howl | null = null;
+  /** Id of the sound playing within the current Howl. */
   private playingId: number | null = null;
-  /**
-   * Where playback was when it was paused.
-   *
-   * Howler's html5 mode builds an <audio> per sound in the Howl, and
-   * `howl.pause()` with no id pauses **all** of them — including one that resets
-   * `currentTime` to 0. Resuming therefore has to re-assert the position rather
-   * than trusting the element to still be where it was.
-   */
-  private pausedAtMs: number | null = null;
   private events: AudioEvents = {};
   private pendingSeek: number | null = null;
   private voulmeLevel = 0.8;
+  /** Playback paused by us; Howler cannot report this reliably. */
+  private paused = false;
+  /** Position when the pause happened, so a resume can restore it. */
+  private pausedAtMs: number | null = null;
+  /** Loudness normalisation from the API for the current track, in dB. */
+  private gainDb = 0;
 
   setEvents(events: AudioEvents) {
     this.events = events;
@@ -55,15 +54,15 @@ export class AudioEngine {
   }
 
   get playing() {
-    const howl = this.howl;
-    if (!howl) return false;
-    return howl.playing(this.playingId ?? undefined);
+    if (!this.howl || this.paused) return false;
+    return this.howl.playing(this.playingId ?? undefined);
   }
 
   /** Position in milliseconds. */
   get position(): number {
     if (!this.howl || this.currentId === null) return 0;
-    const seconds = this.howl.seek();
+    const seconds =
+      this.playingId === null ? this.howl.seek() : this.howl.seek(this.playingId);
     return typeof seconds === "number" ? Math.round(seconds * 1000) : 0;
   }
 
@@ -83,28 +82,31 @@ export class AudioEngine {
       return;
     }
     this.currentId = track.id;
+    this.gainDb = opts.gain ?? 0;
     this.pendingSeek =
       opts.positionMs && opts.positionMs > 500 ? opts.positionMs : null;
 
-    const volume = this.effectiveVolume(opts.gain);
     const howl = new Howl({
       src: [track.url],
-      html5: true,
-      volume,
-      // `format` is inferred from the URL extension; the API sometimes omits it.
+      // Howler keeps `src`/`format` construction-only, hence one Howl per track.
       format: [guessFormat(track.url)],
+      volume: this.effectiveVolume(),
+      html5: true,
       xhr: { method: "GET" },
       onload: () => {
         this.events.onLoad?.(this.duration);
-        if (this.pendingSeek != null) {
-          this.howl?.seek(this.pendingSeek / 1000);
+        if (this.pendingSeek != null && this.playingId !== null) {
+          this.howl?.seek(this.pendingSeek / 1000, this.playingId);
           this.pendingSeek = null;
         }
+        // Started here rather than right after construction: issuing `play()`
+        // while the buffer is still decoding left a sound stuck with no audio.
         if (opts.autoplay) this.play();
       },
       onplay: () => {
-        // `volume()` on the Howl would touch every pooled sound and stack gain,
-        // so it is applied to the sounding id only.
+        this.paused = false;
+        // Scoped to the sounding id; the Howl-level setter touches every pooled
+        // node and can stack gain.
         if (this.playingId !== null) {
           this.howl?.volume(this.effectiveVolume(), this.playingId);
         }
@@ -112,7 +114,7 @@ export class AudioEngine {
       },
       onpause: () => this.events.onPause?.(),
       onend: () => {
-        this.playingHowl = null;
+        this.paused = false;
         this.playingId = null;
         this.events.onEnd?.();
       },
@@ -125,95 +127,113 @@ export class AudioEngine {
       },
     });
     this.howl = howl;
-    if (opts.autoplay) {
-      // Force the underlying media element to load so `onload` fires promptly.
-      howl.load();
-    }
+    if (opts.autoplay) howl.load();
   }
 
   play() {
     const howl = this.howl;
     if (!howl) return;
 
-    if (this.playingHowl === howl && howl.playing(this.playingId ?? undefined)) {
-      return; // already sounding this Howl
-    }
+    // Idempotence must come from our own flag: a paused sound still reports
+    // `playing === true`, so asking Howler here would skip the resume entirely
+    // and leave the track silent.
+    if (!this.paused) return;
 
-    if (this.playingId !== null && this.playingHowl === howl) {
-      // Resume the sound that was paused, then put the position back: the pause
-      // may have reset the element to 0.
-      const resumeAt = this.pausedAtMs;
-      howl.play(this.playingId);
-      if (resumeAt && resumeAt > 500) {
-        this.howl?.seek(resumeAt / 1000, this.playingId);
-      }
-      this.pausedAtMs = null;
-      return;
-    }
+    const id = this.playingId ?? howl.play();
+    if (typeof id !== "number") return;
+    this.playingId = id;
 
-    // First start for this Howl: one source, addressed by its id.
-    const id = howl.play();
-    this.playingHowl = howl;
-    this.playingId = typeof id === "number" ? id : null;
+    const resumeAt = this.pausedAtMs;
+    howl.play(id);
+    // The pause may have reset the element, so re-assert where we were.
+    if (resumeAt && resumeAt > 500) howl.seek(resumeAt / 1000, id);
     this.pausedAtMs = null;
+    this.paused = false;
   }
-
 
   pause() {
     if (!this.howl) return;
-    // Record first: pausing may zero the element's currentTime.
+    // Read the position before pausing; afterwards it may already be 0.
     const at = this.position;
     if (at > 0) this.pausedAtMs = at;
-    // Address the sounding id only; the no-arg form hits every pooled element.
+    // Address the sounding id only — the no-arg form hits every pooled sound.
     if (this.playingId !== null) this.howl.pause(this.playingId);
     else this.howl.pause();
+    this.paused = true;
   }
 
   stop() {
-    this.howl?.stop();
-    this.playingHowl = null;
-    this.playingId = null;
+    if (!this.howl) return;
+    if (this.playingId !== null) this.howl.stop(this.playingId);
+    else this.howl.stop();
+    this.paused = false;
+    this.pausedAtMs = null;
   }
 
   seek(positionMs: number) {
     if (!this.howl) return;
-    if (this.currentId === null) return;
-    this.howl.seek(Math.max(0, positionMs) / 1000);
+    const seconds = Math.max(0, positionMs) / 1000;
+    if (this.playingId !== null) this.howl.seek(seconds, this.playingId);
+    else this.howl.seek(seconds);
   }
 
   setVolume(volume: number) {
     this.voulmeLevel = Math.min(1, Math.max(0, volume));
-    if (this.howl) this.howl.volume(this.effectiveVolume());
+    if (!this.howl) return;
+    const level = this.effectiveVolume();
+    if (this.playingId !== null) this.howl.volume(level, this.playingId);
+    else this.howl.volume(level);
   }
 
   setMuted(muted: boolean) {
     Howler.mute(muted);
   }
 
-  private effectiveVolume(gainDb?: number) {
-    let volume = this.voulmeLevel;
-    // Equal-loudness normalisation from the API, in dB. Only applied when the
-    // payload looks sane, since some tracks report absurd values.
-    const gain = gainDb ?? 0;
-    if (Number.isFinite(gain) && gain !== 0 && Math.abs(gain) < 12) {
-      volume *= 10 ** (gain / 20);
-    }
-    return Math.min(1, Math.max(0, volume));
-  }
-
   dispose() {
-    if (this.howl) {
+    const howl = this.howl as unknown as {
+      _sounds?: Array<{
+        _node?: { disconnect?: () => void; bufferSource?: { disconnect?: () => void } };
+        _panner?: { disconnect?: () => void };
+      }>;
+      unload: () => void;
+    } | null;
+
+    if (howl) {
+      // Sever the graph before unloading. `unload()` leaves each sound's GainNode
+      // connected to the master output, and every live connection is a stream in
+      // the system mixer — discarding Howls without this leaked one per track.
+      for (const sound of howl._sounds ?? []) {
+        for (const node of [sound._panner, sound._node, sound._node?.bufferSource]) {
+          try {
+            node?.disconnect?.();
+          } catch {
+            /* already disconnected */
+          }
+        }
+      }
       try {
-        this.howl.unload();
+        howl.unload();
       } catch {
         /* already torn down */
       }
     }
     this.howl = null;
     this.currentId = null;
-    this.pendingSeek = null;
-    this.playingHowl = null;
     this.playingId = null;
+    this.pendingSeek = null;
+    this.paused = false;
+    this.pausedAtMs = null;
+  }
+
+  private effectiveVolume() {
+    let volume = this.voulmeLevel;
+    // Equal-loudness normalisation from the API, in dB. Only applied when the
+    // payload looks sane, since some tracks report absurd values.
+    const gain = this.gainDb;
+    if (Number.isFinite(gain) && gain !== 0 && Math.abs(gain) < 12) {
+      volume *= 10 ** (gain / 20);
+    }
+    return Math.min(1, Math.max(0, volume));
   }
 
   /** Call once on boot so the audio context resumes after the first gesture. */

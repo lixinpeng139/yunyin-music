@@ -37,6 +37,7 @@ await page.addInitScript(() => {
   }
 })
 
+await page.addInitScript((id) => localStorage.setItem('yunyin.client.v1', id), process.env.CID || '')
 await page.goto('http://127.0.0.1:1570/', { waitUntil: 'domcontentloaded' })
 await page.waitForTimeout(4000)
 

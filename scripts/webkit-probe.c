@@ -75,6 +75,19 @@ static void on_load_changed(WebKitWebView *view, WebKitLoadEvent event, gpointer
   (void)data;
   if (event != WEBKIT_LOAD_FINISHED) return;
 
+  /*
+   * Media tests need a real input event: WebKit refuses play() that no user
+   * gesture preceded, and a synthetic dispatchEvent() from JavaScript does not
+   * count. `gtk_test_widget_click` goes through GTK's input path, which WebKit
+   * does treat as a gesture. Opt in with PROBE_CLICK=1. Note that a window
+   * which never takes focus (a background shell) will not deliver the click,
+   * so media tests are best run from a focused terminal.
+   */
+  if (getenv("PROBE_CLICK")) {
+    gtk_test_widget_click(GTK_WIDGET(view), 1, 0);
+    fprintf(stderr, "PROBE CLICK sent\n");
+  }
+
   /* Give the SPA time to boot, fetch from the bridge and render. */
   char *wrapped = g_strdup_printf(
       "setTimeout(function(){try{%s}catch(e){"

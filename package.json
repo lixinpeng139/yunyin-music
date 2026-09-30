@@ -1,7 +1,7 @@
 {
   "name": "yunyin",
   "private": true,
-  "version": "0.1.0",
+  "version": "0.2.0",
   "type": "module",
   "scripts": {
     "dev": "vite",
@@ -12,7 +12,8 @@
     "tauri": "tauri",
     "app": "tauri dev",
     "app:build": "npm run build:sidecar && ./scripts/build-appimage.sh",
-    "app:deb": "npm run build:sidecar && ./scripts/build-deb.sh"
+    "app:deb": "npm run build:sidecar && ./scripts/build-deb.sh",
+    "test:playback": "node scripts/playback-smoke.mjs"
   },
   "dependencies": {
     "@emotion/react": "^11.14.0",
@@ -23,7 +24,6 @@
     "@tanstack/react-virtual": "^3.14.13",
     "@tauri-apps/api": "^2",
     "@tauri-apps/plugin-opener": "^2",
-    "howler": "^2.2.4",
     "react": "^19.1.0",
     "react-dom": "^19.1.0",
     "react-router-dom": "^7.18.4",
@@ -31,7 +31,6 @@
   },
   "devDependencies": {
     "@tauri-apps/cli": "^2",
-    "@types/howler": "^2.2.13",
     "@types/react": "^19.1.8",
     "@types/react-dom": "^19.1.6",
     "@vitejs/plugin-react": "^6.0.2",

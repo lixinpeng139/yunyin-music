@@ -100,6 +100,15 @@ const QUALITY_KEY = "yunyin.quality";
 const VOLUME_KEY = "yunyin.volume";
 const MODE_KEY = "yunyin.mode";
 
+/** Past this point a play counts as "listened" and is reported to NetEase. */
+const SCROBBLE_AFTER_MS = 20_000;
+/** Past this point `previous()` restarts the track instead of stepping back. */
+const RESTART_INSTEAD_OF_BACK_MS = 4_000;
+/** A run of unplayable tracks this long means the list itself is the problem. */
+const MAX_AUTO_SKIPS = 8;
+/** How long an unplayable track stays on screen before we step over it. */
+const AUTO_SKIP_DELAY_MS = 600;
+
 function readPref<T extends string>(
   key: string,
   allowed: readonly T[],
@@ -121,10 +130,26 @@ function writePref(key: string, value: string) {
   }
 }
 
-let ticker: number | null = null;
 let noticeSeq = 0;
-/** Guards against two tracks racing to resolve/play at once. */
-let playToken = 0;
+/**
+ * Which load owns the engine. Every awaited step compares the value it started
+ * with against this, so a slow response for a track the user already skipped
+ * away from cannot take over the player.
+ */
+let epoch = 0;
+/** Consecutive automatic skips, reset as soon as a track really plays. */
+let autoSkips = 0;
+/** `init()` is called from an effect; StrictMode runs those twice. */
+let initialised = false;
+/**
+ * The tier each cached URL was really resolved at, keyed by track id. The bulk
+ * `/song/url` path in the API layer answers 320k no matter what tier was asked
+ * for, so a URL is only trusted for the current setting when it was fetched at
+ * that setting (or fetched at a higher quality than the user asked for).
+ */
+const urlTier = new Map<number, QualityLevel>();
+/** Lookups in flight, so the prefetcher and the loader share one request. */
+const inFlight = new Map<string, Promise<Track>>();
 
 const ALL_MODES: PlayMode[] = ["list", "single", "shuffle", "heart", "roam"];
 const ALL_QUALITIES: QualityLevel[] = [
@@ -138,29 +163,53 @@ const ALL_QUALITIES: QualityLevel[] = [
   "jymaster",
 ];
 
+/** Ordering of the tiers we care about when comparing a URL against a setting. */
+const TIER_RANK: Record<QualityLevel, number> = {
+  standard: 0,
+  higher: 1,
+  exhigh: 2,
+  lossless: 3,
+  hires: 4,
+  jyeffect: 4,
+  sky: 4,
+  jymaster: 5,
+};
+
 export const usePlayer = create<PlayerState>((set, get) => {
-  function stopTicker() {
-    if (ticker !== null) {
-      window.clearInterval(ticker);
-      ticker = null;
+  /**
+   * Runs an async step and turns a failure into a message.
+   *
+   * Every public action here is called as `void usePlayer.getState().next()` or
+   * awaited by a page that flips a busy flag, and the API layer *does* throw on
+   * a bad response. Letting that escape means an unhandled rejection and — on
+   * the heart page — a button that stays disabled forever. So nothing public
+   * rejects; failures end up in `notice`, which is what the user sees anyway.
+   */
+  async function guard(label: string, run: () => Promise<void>): Promise<void> {
+    try {
+      await run();
+    } catch (error) {
+      console.error(`[player] ${label}`, error);
+      set({ resolving: false, playing: false });
+      get().notify(`${label}失败，请稍后重试`, "error");
     }
   }
 
-  function startTicker() {
-    stopTicker();
-    ticker = window.setInterval(() => {
-      const { playing } = get();
-      if (!playing) return;
-      set({
-        position: audioEngine.position,
-        duration: audioEngine.duration || get().duration,
-      });
-    }, 250);
+  /**
+   * True when a cached URL can be used for `quality` as-is. A URL fetched at a
+   * higher tier is fine too — the user asked for at least that much.
+   */
+  function urlFitsQuality(track: Track, quality: QualityLevel): boolean {
+    if (!track.url) return false;
+    const fetched = urlTier.get(track.id);
+    if (!fetched) return false;
+    if (fetched === quality) return true;
+    return TIER_RANK[fetched] >= TIER_RANK[quality];
   }
 
   /**
-   * Makes sure the given tracks have a playable `url`, asking the API for the
-   * ones that are still missing. Returns the hydrated tracks.
+   * Fills in `url`/`gain`/`bitrate` for tracks that need it and remembers which
+   * tier each URL came back at.
    */
   async function hydrate(
     tracks: Track[],
@@ -168,6 +217,10 @@ export const usePlayer = create<PlayerState>((set, get) => {
   ): Promise<Track[]> {
     const missing = tracks.filter((track) => !track.url);
     if (!missing.length) return tracks;
+
+    // The API layer only honours the exact tier on the single-id endpoint; a
+    // bulk call always answers 320k. Record what we really got.
+    const granted: QualityLevel = missing.length === 1 ? quality : "higher";
 
     const urls = await fetchSongUrls(
       missing.map((track) => track.id),
@@ -186,6 +239,7 @@ export const usePlayer = create<PlayerState>((set, get) => {
               : "版权限制，暂无可用音源",
         };
       }
+      urlTier.set(track.id, granted);
       return {
         ...track,
         url: info.url,
@@ -198,80 +252,170 @@ export const usePlayer = create<PlayerState>((set, get) => {
     });
   }
 
-  /** Resolves upcoming tracks in the background so `next()` never stalls. */
-  function prefetch(from: number) {
-    const { queue, quality } = get();
-    const upcoming = queue.slice(from, from + 4).filter((track) => !track.url);
-    if (!upcoming.length) return;
-    void hydrate(upcoming, quality).then((hydrated) => {
-      if (!hydrated.length) return;
-      const byId = new Map(hydrated.map((track) => [track.id, track]));
-      set((state) => ({
-        queue: state.queue.map((track) => {
-          const fresh = byId.get(track.id);
-          // Only merge URL data; identity of the queue entry is preserved.
-          return fresh && fresh.url ? { ...track, ...fresh } : track;
-        }),
-      }));
-    });
+  /** Resolves one track, sharing an in-flight lookup for the same id + tier. */
+  function resolveOne(track: Track, quality: QualityLevel): Promise<Track> {
+    const key = `${track.id}@${quality}`;
+    const running = inFlight.get(key);
+    if (running) return running;
+    const task = hydrate([{ ...track, url: undefined }], quality)
+      .then((done) => done[0] ?? track)
+      .finally(() => {
+        inFlight.delete(key);
+      });
+    inFlight.set(key, task);
+    return task;
   }
 
-  async function loadIndex(index: number, autoplay: boolean) {
+  /** Merges freshly resolved fields back into the queue, keeping row identity. */
+  function mergeIntoQueue(fresh: Track[]) {
+    if (!fresh.length) return;
+    const byId = new Map(fresh.map((track) => [track.id, track]));
+    set((state) => ({
+      queue: state.queue.map((track) => {
+        const updated = byId.get(track.id);
+        return updated ? { ...track, ...updated } : track;
+      }),
+    }));
+  }
+
+  /**
+   * Warms the next track at the exact tier the user selected (one request) and
+   * the three after it in bulk (one request, 320k), so a single skip never
+   * waits on the network and a real request is only made when that bulk URL
+   * turns out to be below the selected tier.
+   */
+  function prefetch(from: number) {
+    const { queue, quality } = get();
+    const next = queue[from];
+    if (next && !urlFitsQuality(next, quality)) {
+      // Best effort: a failed prefetch only means the real load has to wait for
+      // the network, so it must never surface as an error of its own.
+      void resolveOne(next, quality)
+        .then((done) => {
+          if (done.url) mergeIntoQueue([done]);
+        })
+        .catch(() => {});
+    }
+    const later = queue.slice(from + 1, from + 4).filter((track) => !track.url);
+    if (later.length) {
+      void hydrate(later, quality)
+        .then((done) => {
+          mergeIntoQueue(done.filter((track) => track.url));
+        })
+        .catch(() => {});
+    }
+  }
+
+  function clearUrlCache() {
+    urlTier.clear();
+    inFlight.clear();
+  }
+
+  /**
+   * Steps over a track the API refuses to serve, but only for a while: a queue
+   * where nothing is playable should stop and say so rather than spin.
+   */
+  function scheduleAutoSkip(token: number) {
+    autoSkips += 1;
+    if (autoSkips > Math.min(get().queue.length, MAX_AUTO_SKIPS)) {
+      autoSkips = 0;
+      set({ playing: false });
+      get().notify("这个列表里的歌曲都无法播放", "error");
+      return;
+    }
+    if (get().queue.length <= 1) return;
+    window.setTimeout(() => {
+      if (token !== epoch) return;
+      void get().next({ userInitiated: false });
+    }, AUTO_SKIP_DELAY_MS);
+  }
+
+  async function loadIndex(
+    index: number,
+    opts: { autoplay: boolean; positionMs?: number },
+  ) {
     const state = get();
     const track = state.queue[index];
     if (!track) return;
-    const token = ++playToken;
+    const token = ++epoch;
 
-    set({ index, position: 0, duration: track.duration, resolving: true });
+    set({
+      index,
+      position: opts.positionMs ?? 0,
+      duration: track.duration || 0,
+      resolving: true,
+    });
+
+    // A cached URL from a lower tier than the one selected is worth one more
+    // request: that is what used to make "next" silently play at 320k.
     let ready = track;
-    if (!ready.url) {
-      const [hydrated] = await hydrate([track], state.quality);
-      if (token !== playToken) return;
-      ready = hydrated ?? track;
-      set((current) => ({
-        queue: current.queue.map((item, i) =>
-          i === index ? { ...item, ...ready } : item,
-        ),
-      }));
+    if (!urlFitsQuality(track, state.quality)) {
+      const fresh = await resolveOne(track, state.quality);
+      if (token !== epoch) return;
+      // Never trade a working URL for a failed lookup.
+      if (fresh.url) {
+        ready = { ...track, ...fresh };
+        mergeIntoQueue([ready]);
+      }
     }
-    if (token !== playToken) return;
+    if (token !== epoch) return;
 
     if (!ready.url) {
       set({ resolving: false, playing: false });
       get().notify(ready.unplayableReason ?? "这首歌曲暂时无法播放", "error");
-      // Skip past unplayable tracks instead of stalling the queue.
-      if (get().queue.length > 1) {
-        window.setTimeout(() => {
-          if (token === playToken) void get().next({ userInitiated: false });
-        }, 600);
-      }
+      scheduleAutoSkip(token);
       return;
     }
 
     audioEngine.setEvents({
       onLoad: (durationMs) => {
-        if (token !== playToken) return;
-        set({ duration: durationMs || ready.duration, resolving: false });
+        if (token !== epoch) return;
+        autoSkips = 0;
+        set({
+          duration: durationMs || ready.duration || 0,
+          resolving: false,
+        });
       },
       onPlay: () => {
-        if (token !== playToken) return;
+        if (token !== epoch) return;
         set({ playing: true, resolving: false });
-        startTicker();
       },
       onPause: () => {
-        if (token !== playToken) return;
+        if (token !== epoch) return;
         set({ playing: false });
-        stopTicker();
       },
       onEnd: () => {
-        if (token !== playToken) return;
+        if (token !== epoch) return;
         void handleEnded();
       },
+      onProgress: (positionMs, durationMs) => {
+        if (token !== epoch) return;
+        // Only touch what actually moved: this fires four times a second and
+        // every write re-renders whatever subscribes to it.
+        const patch: Partial<PlayerState> = {};
+        if (positionMs !== get().position) patch.position = positionMs;
+        if (durationMs > 0 && durationMs !== get().duration)
+          patch.duration = durationMs;
+        if (get().resolving) patch.resolving = false;
+        if (Object.keys(patch).length) set(patch);
+      },
+      onBuffering: (buffering) => {
+        if (token !== epoch) return;
+        if (buffering && !get().playing) return;
+        set({ resolving: buffering });
+      },
+      onBlocked: () => {
+        if (token !== epoch) return;
+        // Not a broken track — WebKit just wants a click first.
+        set({ playing: false, resolving: false });
+        get().notify("浏览器阻止了自动播放，请点一下播放按钮", "info");
+      },
       onError: (message) => {
-        if (token !== playToken) return;
+        if (token !== epoch) return;
         set({ playing: false, resolving: false });
         get().notify(message, "error");
         // A dead URL is worse than no URL: drop it so a retry re-resolves.
+        urlTier.delete(track.id);
         set((current) => ({
           queue: current.queue.map((item, i) =>
             i === index
@@ -283,8 +427,12 @@ export const usePlayer = create<PlayerState>((set, get) => {
     });
 
     audioEngine.setVolume(state.volume);
-    audioEngine.load(ready, { autoplay, gain: ready.gain });
-    if (!autoplay) set({ playing: false, resolving: false });
+    audioEngine.setMuted(state.muted);
+    audioEngine.load(ready, {
+      autoplay: opts.autoplay,
+      positionMs: opts.positionMs,
+      gain: ready.gain,
+    });
     prefetch(index + 1);
   }
 
@@ -381,9 +529,12 @@ export const usePlayer = create<PlayerState>((set, get) => {
       }
       const index = Math.min(Math.max(0, startIndex), clean.length - 1);
       const mode = options.mode ?? get().mode;
+      autoSkips = 0;
       set({ queue: clean, mode, source: source ?? null, heartSeed: null });
       writePref(MODE_KEY, mode);
-      await loadIndex(index, options.autoplay ?? true);
+      await guard("载入歌曲", () =>
+        loadIndex(index, { autoplay: options.autoplay ?? true }),
+      );
     },
 
     async playTrack(track, source = null) {
@@ -395,7 +546,8 @@ export const usePlayer = create<PlayerState>((set, get) => {
           if (!state.playing) get().resume();
           return;
         }
-        await loadIndex(existing, true);
+        autoSkips = 0;
+        await guard("载入歌曲", () => loadIndex(existing, { autoplay: true }));
         return;
       }
       await get().playQueue(
@@ -424,21 +576,46 @@ export const usePlayer = create<PlayerState>((set, get) => {
     },
 
     removeFromQueue(index) {
-      set((state) => {
-        if (index < 0 || index >= state.queue.length) return state;
-        const queue = state.queue.filter((_, i) => i !== index);
-        let nextIdx = state.index;
-        if (index < state.index) nextIdx = state.index - 1;
-        else if (index === state.index)
-          nextIdx = Math.min(state.index, queue.length - 1);
-        return { queue, index: nextIdx };
-      });
+      const state = get();
+      if (index < 0 || index >= state.queue.length) return;
+      const queue = state.queue.filter((_, i) => i !== index);
+
+      if (!queue.length) {
+        epoch += 1;
+        audioEngine.dispose();
+        set({
+          queue,
+          index: -1,
+          playing: false,
+          position: 0,
+          duration: 0,
+          resolving: false,
+        });
+        return;
+      }
+
+      if (index < state.index) {
+        set({ queue, index: state.index - 1 });
+        return;
+      }
+      if (index > state.index) {
+        set({ queue });
+        return;
+      }
+
+      // The row that was sounding is gone. Move the audio with the list, or the
+      // UI shows one track while a removed one keeps playing.
+      const nextIdx = Math.min(state.index, queue.length - 1);
+      set({ queue, index: nextIdx });
+      void guard("载入歌曲", () =>
+        loadIndex(nextIdx, { autoplay: state.playing }),
+      );
     },
 
     clearQueue() {
-      playToken += 1;
+      epoch += 1;
+      autoSkips = 0;
       audioEngine.dispose();
-      stopTicker();
       set({
         queue: [],
         index: -1,
@@ -446,6 +623,7 @@ export const usePlayer = create<PlayerState>((set, get) => {
         position: 0,
         duration: 0,
         source: null,
+        resolving: false,
       });
     },
 
@@ -458,41 +636,47 @@ export const usePlayer = create<PlayerState>((set, get) => {
 
     pause() {
       audioEngine.pause();
+      // Pausing is always truthful: the element is asked to pause immediately.
       set({ playing: false });
-      stopTicker();
     },
 
     resume() {
+      const { queue, index } = get();
+      if (index < 0 || !queue[index]) return;
       audioEngine.setVolume(get().volume);
+      audioEngine.setMuted(get().muted);
       audioEngine.play();
-      set({ playing: true });
-      startTicker();
+      // `playing` is set from the element's own `play` event. Claiming it here
+      // is what used to leave the UI showing playback that was not happening.
     },
 
     async next(options = {}) {
       const state = get();
       const track = state.current();
       // A skip counts as a play once a meaningful portion has been heard.
-      if (track && options.userInitiated && state.position > 20_000) {
+      if (track && options.userInitiated && state.position > SCROBBLE_AFTER_MS) {
         void scrobble(track, state.position);
       }
-      let target = nextIndex(state.index);
-      if (target === null) {
-        const extended = await extendSpecialModes();
-        if (!extended) {
-          set({ playing: false });
-          if (options.userInitiated) get().notify("已经没有更多推荐了", "info");
-          return;
+      if (options.userInitiated) autoSkips = 0;
+      await guard("切歌", async () => {
+        let target = nextIndex(state.index);
+        if (target === null) {
+          const extended = await extendSpecialModes();
+          if (!extended) {
+            set({ playing: false });
+            if (options.userInitiated) get().notify("已经没有更多推荐了", "info");
+            return;
+          }
+          target = get().queue.length - 1;
         }
-        target = get().queue.length - 1;
-      }
-      await loadIndex(target, true);
+        await loadIndex(target, { autoplay: true });
+      });
     },
 
     async previous() {
       const state = get();
       // Match every other player: restart the track unless near its start.
-      if (state.position > 4000) {
+      if (state.position > RESTART_INSTEAD_OF_BACK_MS) {
         audioEngine.seek(0);
         set({ position: 0 });
         return;
@@ -502,14 +686,18 @@ export const usePlayer = create<PlayerState>((set, get) => {
         set({ position: 0 });
         return;
       }
+      autoSkips = 0;
       const target =
         state.index - 1 < 0 ? state.queue.length - 1 : state.index - 1;
-      await loadIndex(target, true);
+      await guard("载入歌曲", () => loadIndex(target, { autoplay: true }));
     },
 
     seek(positionMs) {
-      audioEngine.seek(positionMs);
-      set({ position: Math.max(0, positionMs) });
+      const duration = get().duration;
+      const target = Math.max(0, positionMs);
+      const clamped = duration > 0 ? Math.min(target, duration) : target;
+      audioEngine.seek(clamped);
+      set({ position: clamped });
     },
 
     setVolume(volume) {
@@ -530,16 +718,23 @@ export const usePlayer = create<PlayerState>((set, get) => {
       writePref(QUALITY_KEY, quality);
       const { index, playing } = get();
       if (index < 0) {
+        clearUrlCache();
         set({ quality });
         return;
       }
-      // Force a re-resolve at the new tier: every cached URL is dropped, the
-      // current track reloads immediately and the rest refill via prefetch.
+      // Every cached URL belongs to the old tier.
+      const position = audioEngine.position || get().position;
+      clearUrlCache();
       set((state) => ({
         quality,
         queue: state.queue.map((track) => ({ ...track, url: undefined })),
       }));
-      void loadIndex(index, playing);
+      // Reload at the same spot and in the same state. Passing the position is
+      // what stops a quality switch from restarting the track — and reloading
+      // even while paused is what stops it from going permanently silent.
+      void guard("切换音质", () =>
+        loadIndex(index, { autoplay: playing, positionMs: position }),
+      );
     },
 
     async setMode(mode) {
@@ -553,7 +748,7 @@ export const usePlayer = create<PlayerState>((set, get) => {
         return;
       }
       set({ mode, heartSeed: null });
-      const { queue, index, playing } = get();
+      const { queue, index } = get();
       if (mode === "shuffle" && queue.length > 1) {
         // Shuffle the remainder so the current track keeps playing.
         const head = queue.slice(0, index + 1);
@@ -564,7 +759,6 @@ export const usePlayer = create<PlayerState>((set, get) => {
         }
         set({ queue: [...head, ...tail] });
       }
-      if (playing) startTicker();
     },
 
     async startHeartMode(seed) {
@@ -598,14 +792,16 @@ export const usePlayer = create<PlayerState>((set, get) => {
       }
       set({ mode: "heart", heartSeed: { songId: anchor.songId, playlistId } });
       writePref(MODE_KEY, "heart");
-      const batch = await fetchIntelligenceList(anchor.songId, playlistId, 20);
-      const hydrated = await hydrate(batch, state.quality);
-      if (!hydrated.length) {
-        get().notify("没有取到心动推荐，请稍后再试", "error");
-        return;
-      }
-      await get().playQueue(hydrated, 0, state.source, { mode: "heart" });
-      set({ heartSeed: { songId: anchor.songId, playlistId } });
+      await guard("开启心动模式", async () => {
+        const batch = await fetchIntelligenceList(anchor.songId, playlistId, 20);
+        const hydrated = await hydrate(batch, state.quality);
+        if (!hydrated.length) {
+          get().notify("没有取到心动推荐，请稍后再试", "error");
+          return;
+        }
+        await get().playQueue(hydrated, 0, state.source, { mode: "heart" });
+        set({ heartSeed: { songId: anchor.songId, playlistId } });
+      });
     },
 
     async startRoamMode() {
@@ -616,23 +812,25 @@ export const usePlayer = create<PlayerState>((set, get) => {
       const state = get();
       set({ mode: "roam" });
       writePref(MODE_KEY, "roam");
-      const batch = await fetchPersonalFm();
-      if (!batch.length) {
-        get().notify("私人 FM 暂时没有内容", "error");
-        return;
-      }
-      const hydrated = await hydrate(batch, state.quality);
-      const playable = hydrated.filter((track) => track.url);
-      if (!playable.length) {
-        get().notify("私人 FM 返回的歌曲暂时无法播放", "error");
-        return;
-      }
-      await get().playQueue(
-        playable,
-        0,
-        { kind: "fm", name: "私人漫游" },
-        { mode: "roam" },
-      );
+      await guard("开启漫游模式", async () => {
+        const batch = await fetchPersonalFm();
+        if (!batch.length) {
+          get().notify("私人 FM 暂时没有内容", "error");
+          return;
+        }
+        const hydrated = await hydrate(batch, state.quality);
+        const playable = hydrated.filter((track) => track.url);
+        if (!playable.length) {
+          get().notify("私人 FM 返回的歌曲暂时无法播放", "error");
+          return;
+        }
+        await get().playQueue(
+          playable,
+          0,
+          { kind: "fm", name: "私人漫游" },
+          { mode: "roam" },
+        );
+      });
     },
 
     toggleLike(trackId) {
@@ -659,6 +857,8 @@ export const usePlayer = create<PlayerState>((set, get) => {
     },
 
     init() {
+      if (initialised) return;
+      initialised = true;
       const quality = readPref<QualityLevel>(
         QUALITY_KEY,
         ALL_QUALITIES,
@@ -677,9 +877,14 @@ export const usePlayer = create<PlayerState>((set, get) => {
         volume,
       });
       audioEngine.setVolume(volume);
-      // WebKit leaves the audio context suspended until a real user gesture.
-      const unlock = () => AudioEngine.unlock();
-      window.addEventListener("pointerdown", unlock, { once: true });
+      // A refused play() is retried from the next real gesture. The listener
+      // stays installed rather than firing once: WebKit can refuse a play at
+      // any point — an auto-advance after a track ends is as programmatic as
+      // the first load — and `unlock()` does nothing unless something was
+      // actually refused.
+      const retry = () => AudioEngine.unlock();
+      window.addEventListener("pointerdown", retry);
+      window.addEventListener("keydown", retry);
     },
   };
 });

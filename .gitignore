@@ -1,0 +1,36 @@
+# Logs
+logs
+*.log
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+lerna-debug.log*
+
+node_modules
+dist
+dist-ssr
+*.local
+
+# Editor directories and files
+.vscode/*
+!.vscode/extensions.json
+.idea
+.DS_Store
+*.suo
+*.ntvs*
+*.njsproj
+*.sln
+*.sw?
+
+# Build outputs and caches that are large and reproducible
+src-tauri/target
+src-tauri/binaries
+src-tauri/gen
+sidecar/node_modules
+sidecar/dist
+sidecar/.cache
+
+# 调试期间生成的二维码图片，不要提交
+qr-*.png
+qr-*.svg

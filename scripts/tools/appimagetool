@@ -1,0 +1,52 @@
+#!/usr/bin/env bash
+# Wrapper around appimagetool that supplies the AppImage type-2 runtime locally.
+#
+# `appimagetool` fetches `runtime-x86_64` from GitHub on every run, and its
+# built-in downloader does not follow the redirect that GitHub releases use
+# ("Failed to download runtime: server returned status code 0"). That breaks
+# `tauri build --bundles appimage`. `scripts/fetch-appimage-runtime.sh` caches
+# the file; this wrapper passes it through `--runtime-file`.
+set -uo pipefail
+
+# Prefer an explicit override, then our own cache, then anything usable on disk.
+CANDIDATES=(
+  "${APPIMAGE_RUNTIME_FILE:-}"
+  "$HOME/.cache/yunyin/runtime-x86_64"
+  "/tmp/runtime-x86_64"
+)
+RUNTIME=""
+for candidate in "${CANDIDATES[@]}"; do
+  if [ -n "$candidate" ] && [ -s "$candidate" ]; then RUNTIME="$candidate"; break; fi
+done
+
+if [ -z "$RUNTIME" ]; then
+  echo "appimagetool wrapper: no cached runtime; run scripts/fetch-appimage-runtime.sh" >&2
+  exit 127
+fi
+
+# Locate the real appimagetool: explicit override first, then PATH, skipping self.
+REAL="${APPIMAGETOOL_REAL:-}"
+if [ -z "$REAL" ]; then
+  SELF="$(readlink -f "$0")"
+  IFS=: read -r -a DIRS <<< "$PATH"
+  for dir in "${DIRS[@]}"; do
+    candidate="$dir/appimagetool"
+    [ -x "$candidate" ] || continue
+    [ "$(readlink -f "$candidate")" = "$SELF" ] && continue
+    REAL="$candidate"
+    break
+  done
+fi
+
+if [ -z "$REAL" ]; then
+  echo "appimagetool wrapper: could not find the real appimagetool" >&2
+  exit 127
+fi
+
+for arg in "$@"; do
+  case "$arg" in
+    --runtime-file*) exec "$REAL" "$@" ;;
+  esac
+done
+
+exec "$REAL" --runtime-file "$RUNTIME" "$@"

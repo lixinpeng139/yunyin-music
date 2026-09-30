@@ -1,0 +1,48 @@
+{
+  "name": "yunyin",
+  "private": true,
+  "version": "0.1.0",
+  "type": "module",
+  "scripts": {
+    "dev": "vite",
+    "build:web": "tsc --noEmit && vite build",
+    "build:sidecar": "node scripts/build-sidecar.mjs",
+    "typecheck": "tsc --noEmit",
+    "preview": "vite preview",
+    "tauri": "tauri",
+    "app": "tauri dev",
+    "app:build": "npm run build:sidecar && ./scripts/build-appimage.sh",
+    "app:deb": "npm run build:sidecar && tauri build --bundles deb"
+  },
+  "dependencies": {
+    "@emotion/react": "^11.14.0",
+    "@emotion/styled": "^11.14.1",
+    "@mui/icons-material": "^9.4.0",
+    "@mui/material": "^9.4.0",
+    "@mui/material-nextjs": "^9.4.0",
+    "@tanstack/react-virtual": "^3.14.13",
+    "@tauri-apps/api": "^2",
+    "@tauri-apps/plugin-opener": "^2",
+    "howler": "^2.2.4",
+    "react": "^19.1.0",
+    "react-dom": "^19.1.0",
+    "react-router-dom": "^7.18.4",
+    "zustand": "^5.0.15"
+  },
+  "devDependencies": {
+    "@tauri-apps/cli": "^2",
+    "@types/howler": "^2.2.13",
+    "@types/react": "^19.1.8",
+    "@types/react-dom": "^19.1.6",
+    "@vitejs/plugin-react": "^6.0.2",
+    "esbuild": "^0.28.2",
+    "playwright": "^1.63.0",
+    "postject": "^1.0.0-alpha.6",
+    "typescript": "~6.0.3",
+    "vite": "^8.0.16"
+  },
+  "allowScripts": {
+    "esbuild@0.28.2": true
+  },
+  "description": "云音 - 网易云音乐第三方桌面客户端（Material Design）"
+}

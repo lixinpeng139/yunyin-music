@@ -22,7 +22,9 @@ LD_ROOT="$HOME/.cache/yunyin/linuxdeploy"
 APPIMAGE_TOOL="$LD_ROOT/plugins/linuxdeploy-plugin-appimage/appimagetool-prefix/AppRun"
 BUNDLE_DIR="$ROOT/src-tauri/target/release/bundle/appimage"
 APP_DIR="$BUNDLE_DIR/yunyin.AppDir"
-OUTPUT="$BUNDLE_DIR/yunyin_0.1.0_amd64.AppImage"
+CONF_VERSION="$(node -p "require('$ROOT/src-tauri/tauri.conf.json').version")"
+CONF_PRODUCT="$(node -p "require('$ROOT/src-tauri/tauri.conf.json').productName")"
+OUTPUT="$BUNDLE_DIR/${CONF_PRODUCT}_${CONF_VERSION}_amd64.AppImage"
 
 if [ ! -s "$RUNTIME" ]; then
   echo "[bundle] runtime missing at $RUNTIME" >&2

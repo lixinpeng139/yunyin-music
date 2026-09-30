@@ -1,6 +1,6 @@
 [package]
 name = "yunyin"
-version = "0.1.0"
+version = "0.2.0"
 description = "网易云音乐第三方桌面客户端（Material Design）"
 authors = ["YunYin contributors"]
 edition = "2021"

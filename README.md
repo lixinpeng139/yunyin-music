@@ -32,16 +32,16 @@
 
 | 格式 | 适用 | 说明 |
 | --- | --- | --- |
-| `yunyin_0.1.0_amd64.deb` | Debian / Ubuntu | **推荐**。依赖由包管理器保证，含播放所需的 GStreamer 插件 |
-| `yunyin-0.1.0-x86_64.AppImage` | 其它发行版 | 自包含（WebKit、GTK、GStreamer 及 193 个插件都在里面），无需预装依赖 |
+| `yunyin_0.2.0_amd64.deb` | Debian / Ubuntu | **推荐**。依赖由包管理器保证，含播放所需的 GStreamer 插件 |
+| `yunyin_0.2.0_amd64.AppImage` | 其它发行版 | 自包含（WebKit、GTK、GStreamer 及 193 个插件都在里面），无需预装依赖 |
 
 ```bash
 # Debian / Ubuntu
-sudo apt install ./yunyin_0.1.0_amd64.deb
+sudo apt install ./yunyin_0.2.0_amd64.deb
 
 # AppImage
-chmod +x yunyin-0.1.0-x86_64.AppImage
-./yunyin-0.1.0-x86_64.AppImage
+chmod +x yunyin_0.2.0_amd64.AppImage
+./yunyin_0.2.0_amd64.AppImage
 ```
 
 两种格式都会注册桌面入口，安装后在启动器里搜索「云音」即可。
@@ -53,14 +53,14 @@ chmod +x yunyin-0.1.0-x86_64.AppImage
 deb 会自动注册，AppImage 需要手动执行一次：
 
 ```bash
-./scripts/install-desktop.sh /path/to/yunyin-0.1.0-x86_64.AppImage
+./scripts/install-desktop.sh /path/to/yunyin_0.2.0_amd64.AppImage
 ```
 
 之后 `Mod+D` 里搜索「云音」即可。想在 niri 里直接绑定快捷键，在
 `~/.config/niri/binds.kdl` 加：
 
 ```kdl
-Mod+Shift+M { spawn "/path/to/yunyin-0.1.0-x86_64.AppImage"; }
+Mod+Shift+M { spawn "/path/to/yunyin_0.2.0_amd64.AppImage"; }
 ```
 
 ## 从源码运行

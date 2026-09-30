@@ -18,7 +18,8 @@ export PATH="$HOME/.cargo/bin:$PATH"
 echo "[deb] building"
 npx tauri build --bundles deb 2>&1 | grep -E "Bundling|Finished|error" | tail -4 || true
 
-DEB="$(ls -t "$BUNDLE"/yunyin_*.deb 2>/dev/null | head -1)"
+CONF_VERSION="$(node -p "require('$ROOT/src-tauri/tauri.conf.json').version")"
+DEB="$(ls -t "$BUNDLE"/yunyin_"$CONF_VERSION"_*.deb 2>/dev/null | head -1)"
 if [ -z "$DEB" ] || [ ! -s "$DEB" ]; then
   echo "[deb] no package produced" >&2
   exit 1
